@@ -1249,6 +1249,7 @@
 
   // The two things people do every day, always at hand
   function renderActions(now) {
+    scheduleAlarms();
     const a = $('actions');
     a.hidden = !wx;
     $('tabs').hidden = !wx;
@@ -1349,7 +1350,7 @@
             : eve.rows.length ? '<p class="advice ok">✅ הערב יספיק לכולם בלי דוד</p>' : ''}
           <div class="boil-grid">${[10, 20, 30, 45, 60, 90].map(m => `<button type="button" data-sheet-boil="${m}">${ltr(m)} דק׳</button>`).join('')}
             <button type="button" class="wide" data-sheet-boil="open">עד שאכבה</button></div>
-          <p class="note">⏰ כשהזמן ייגמר האתר יצפצף, כל עוד הוא פתוח (בטלפון נעול או במצב שקט – לא). הדלקה מלפני כמה שעות? אפשר לרשום אותה בדיעבד בלשונית "יומן".</p>`;
+          <p class="note">⏰ בזמן שהדוד דולק תופיע ספירה לאחור, והאתר ישאיר את המסך דלוק – ובסוף יצפצף (כל עוד האתר פתוח; במצב שקט – בלי צליל). הדלקה מלפני כמה שעות? אפשר לרשום אותה בדיעבד בלשונית "יומן".</p>`;
     }
     w.innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="${sheet.kind === 'log' ? 'רישום מקלחת' : 'הדוד החשמלי'}" tabindex="-1">
       <div class="grab"></div><button type="button" class="sheet-close" data-sheet-close aria-label="סגירה">✕</button>${html}</div>`;
@@ -1782,16 +1783,12 @@
     commit([{ op: 'boiler', b }]);
     if (min != null) {
       armAlarm(b, forName);
-      // the phone itself can remind even when it's locked or silent: Android's clock timer, an iPhone calendar alert
-      const said = `🔌 נרשם: הדוד דלוק ל-${min} דק׳${forName ? ` (ל${forName})` : ''}`;
-      if (ANDROID) showToast(said, () => phoneTimer(min, forName), 20000, '⏰ טיימר בטלפון');
-      else if (IOS) showToast(said, () => calendarReminder(b, forName), 20000, '⏰ תזכורת ביומן');
+      // on an iPhone a calendar alert can also ring when it's locked (Android's Chrome won't let a page set the
+      // clock's timer); everywhere, the countdown keeps the screen on so the page's own beep sounds
+      if (IOS) showToast(`🔌 נרשם: הדוד דלוק ל-${min} דק׳${forName ? ` (ל${forName})` : ''}`, () => calendarReminder(b, forName), 20000, '⏰ תזכורת ביומן');
     }
     return true;
   }
-  // The clock app's timer, with a label that says why it rings. Chrome may refuse to open it from a web page;
-  // then it comes back to the page with #timer-failed, which explains.
-  const ANDROID = /android/i.test(navigator.userAgent);
   const IOS = /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
   // iPhone: no web page can set the clock's timer, but a calendar event with an alert at the end time can be
   // added in two taps (Safari opens it with "Add to Calendar")
@@ -1807,21 +1804,6 @@
       'END:VEVENT', 'END:VCALENDAR'].join('\r\n');
     location.href = 'data:text/calendar;charset=utf-8,' + encodeURIComponent(ics);
   }
-  function phoneTimer(min, forName) {
-    const label = `🔌 לכבות את הדוד${forName ? ` – ${forName} יכול/ה להתקלח` : ` (${min} דק׳)`}`;
-    const back = location.href.split('#')[0] + '#timer-failed';
-    location.href = 'intent:#Intent;action=android.intent.action.SET_TIMER;' +
-      'i.android.intent.extra.alarm.LENGTH=' + Math.round(min * 60) + ';' +
-      'S.android.intent.extra.alarm.MESSAGE=' + encodeURIComponent(label) + ';' +
-      'B.android.intent.extra.alarm.SKIP_UI=true;' +
-      'S.browser_fallback_url=' + encodeURIComponent(back) + ';end';
-  }
-  function timerFailed() {
-    if (location.hash !== '#timer-failed') return;
-    history.replaceState(null, '', location.pathname + location.search);
-    showToast('הטלפון לא אפשר לאתר לפתוח את הטיימר של השעון. האתר עדיין יצפצף בסוף הזמן כשהוא פתוח – או שאפשר לכוון טיימר באפליקציית השעון.', null, 20000);
-  }
-  addEventListener('hashchange', timerFailed);
   let audio = null;
   function unlockAudio() {
     try {
@@ -1863,14 +1845,53 @@
     if (due.length) ring(due[due.length - 1], now);
     const next = later.sort((x, y) => x.end - y.end)[0];
     if (next) alarmTimer = setTimeout(scheduleAlarms, Math.min(next.end - now + 200, 2 ** 31 - 1));
+    countdown(next);
   }
+
+  // A countdown at the top while a timed run started here is on, and the screen kept on (if the phone allows
+  // it) – a sleeping page can't beep. One tap turns the screen-keeping off; it's remembered.
+  let wakeLock = null, tick = null;
+  const keepAwake = () => store.get('hwm.keepAwake', true);
+  async function holdScreen(on) {
+    try {
+      if (on && !wakeLock && 'wakeLock' in navigator && document.visibilityState === 'visible') {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      } else if (!on && wakeLock) { const w = wakeLock; wakeLock = null; await w.release(); }
+    } catch { wakeLock = null; }
+  }
+  function countdown(a) {
+    let el = $('countdown');
+    if (!a) { if (el) el.remove(); clearInterval(tick); tick = null; holdScreen(false); return; }
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'countdown'; el.className = 'countdown';
+      el.innerHTML = '<span role="timer" aria-live="off"></span>' + ('wakeLock' in navigator ? '<button type="button" class="linkish" data-awake></button>' : '');
+      document.body.appendChild(el);
+    }
+    const draw = () => {
+      const left = Math.max(0, a.end - Date.now()), mm = Math.floor(left / 60000), ss = Math.floor(left % 60000 / 1000);
+      el.firstChild.innerHTML = `⏰ <b dir="ltr">${mm}:${String(ss).padStart(2, '0')}</b> עד סוף הדוד${a.name ? ` (ל${esc(a.name)})` : ''}`;
+      const btn = el.querySelector('[data-awake]');
+      if (btn) btn.textContent = keepAwake() ? '📱 המסך יישאר דלוק עד הצפצוף · לא צריך' : '📱 להשאיר את המסך דלוק';
+    };
+    draw();
+    holdScreen(keepAwake());
+    clearInterval(tick);
+    tick = setInterval(() => { if (Date.now() >= a.end) scheduleAlarms(); else draw(); }, 1000);
+  }
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('[data-awake]')) return;
+    store.set('hwm.keepAwake', !keepAwake());
+    scheduleAlarms();
+  });
   function ring(a, now) {
     const late = now - a.end > 2 * 60000; // the page was closed or asleep when it was due
     if (!late) { beep(); try { navigator.vibrate && navigator.vibrate([300, 150, 300, 150, 300]); } catch {} }
     const what = `${a.min} הדקות של הדוד${a.name ? ` (ל${a.name})` : ''}`;
     showToast(`⏰ ${late ? `${what} נגמרו ב-${wx ? hhmm(a.end) : ''}` : `עברו ${what}`} – זה הזמן לכבות אותו, אם הוא לא כבה לבד.`, null, 60000);
   }
-  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') scheduleAlarms(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') scheduleAlarms(); }); // also takes the screen lock back
   // any tap makes the sound ready, so a run started before a reload can still beep
   document.addEventListener('pointerdown', () => { if (!audio && store.get(ALARMS, []).length) unlockAudio(); }, { passive: true });
 
@@ -2126,7 +2147,7 @@
   document.addEventListener('hwm:weather', (e) => onWeather(e.detail));
   if (window.HWM && HWM.weather) onWeather(HWM.weather);
   scheduleAlarms(); // a timed run started here before the page was reloaded
-  timerFailed();
+  if (location.hash === '#timer-failed') history.replaceState(null, '', location.pathname + location.search); // from an old version
 
   // keep "now" fresh while the page stays open
   // every minute while the boiler is on (the tank is warming), every 5 otherwise
