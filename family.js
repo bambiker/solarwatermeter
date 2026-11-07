@@ -339,6 +339,52 @@
   const planDraw = (m) => planNeed(m) * perLiter();
   const okEnd = () => tsh() + SAFE_END;
 
+  // ---------- People who shower until the hot water runs out ----------
+  // Some people simply use whatever hot water there is. Their answer is nearly always "ran out", so the
+  // learning gives them huge showers and the advice would keep the boiler on for ages – while more boiler
+  // only makes their shower longer. Their signs: most of their showers "run out", also when the tank held
+  // half as much again as a normal shower needs, and so the learning gives them at least two normal showers
+  // (tested: someone using it all came out at 111 L against 36–49 for the rest). The learning keeps them as they are (they do empty the tank for whoever comes next); the
+  // advice heats for a normal shower for them, and suggests they shower last.
+  let elasticIds = new Set(), elasticKey = '';
+  function findElastic() {
+    if (!wx) return elasticIds;
+    const logs = learnableLogs();
+    const key = [logs.length, logs.length ? logs[logs.length - 1].t : 0, cfg.eff, cfg.tau, cfg.driftAt, cfg.perPerson].join('|');
+    if (key === elasticKey) return elasticIds;
+    elasticKey = key;
+    const byMember = {};
+    logs.forEach((l, i) => { (byMember[l.member] ||= []).push(i); });
+    // of the showers that had hot water at the start, most "ran out" (no hot water at all says nothing about them)
+    const cand = Object.entries(byMember).filter(([id, idx]) => {
+      const m = member(id), hot = idx.filter(i => logs[i].outcome !== 'none');
+      if (!m || m.liters == null || m.liters < 2 * cfg.perPerson) return false;
+      return hot.length >= 5 && hot.filter(i => logs[i].outcome === 'partial').length / hot.length >= 0.6;
+    });
+    const out = new Set();
+    if (cand.length) {
+      const before = tempsBeforeShowers(simPlan(logs)); // the tank as the model expected it, before each answer
+      for (const [id, idx] of cand) {
+        const ran = idx.filter(i => logs[i].outcome === 'partial');
+        const rich = ran.filter(i => {
+          seasonAir = before[i].air;
+          try { return before[i].S.t >= tsh() + 1.5 * cfg.perPerson * perLiter(); } finally { seasonAir = null; }
+        }).length;
+        if (rich >= 3) out.add(id);
+      }
+    }
+    elasticIds = out;
+    return out;
+  }
+  const isElastic = (m) => !!m && elasticIds.has(m.id);
+  // their own shower: a normal one for someone who'd use it all anyway
+  const selfNeed = (m) => (isElastic(m) ? cfg.perPerson : planNeed(m));
+  // one person's shower: is it hot for them (start/end), and the tank after it (they may use up the rest)
+  function showerOf(S, m) {
+    const D = drawS(S, selfNeed(m));
+    return isElastic(m) ? { start: D.start, end: D.end, S: drawS(S, planNeed(m)).S } : D;
+  }
+
   // Boiler minutes for one shower of L liters to be hot to the end (capped: not even at the thermostat).
   // With an accelerator there's a margin: the water goes cold suddenly there, so a shower planned to end
   // exactly at shower temperature ends cold at the smallest error in the estimate. (Tested on a stratified
@@ -682,21 +728,21 @@
     let S = S0;
     const who = fam.members.filter(m => !isGeneric(m) && (!m.skip || !m.skip[slot]) && !away.has(m.id));
     const rows = who.map(m => {
-      const D = drawS(S, planNeed(m));
+      const D = showerOf(S, m);
       const st = D.end >= okEnd() - 0.05 ? 'ok' : D.start > tsh() ? 'partial' : 'cold';
       S = D.S;
       return { m, st };
     });
     // boiler minutes before the first shower for everyone in a row, and how many that gives a full shower
-    const inRow = (min) => { let s = heatS(S0, min), n = 0; for (const m of who) { const D = drawS(s, planNeed(m)); if (D.end < okEnd() - 0.05) break; s = D.S; n++; } return n; };
+    const inRow = (min) => { let s = heatS(S0, min), n = 0; for (const m of who) { const D = showerOf(s, m); if (D.end < okEnd() - 0.05) break; s = D.S; n++; } return n; };
     let minutes, withHeater;
-    if (accF() >= 1) { // one volume: straight to the temperature everyone needs (or the thermostat)
+    if (accF() >= 1 && !who.some(isElastic)) { // one volume: straight to the temperature everyone needs (or the thermostat)
       const needT = okEnd() + who.reduce((s, m) => s + planDraw(m), 0);
       const target = Math.min(needT, Math.max(stat(), T0));
       minutes = T0 >= needT ? 0 : Math.ceil((target - T0) / elecPerMin());
       let Th = target; withHeater = 0;
       for (const m of who) { if (Th - planDraw(m) < okEnd() - 0.05) break; Th -= planDraw(m); withHeater++; }
-    } else { // accelerator: only the top heats, so more minutes stop helping once it reaches the thermostat
+    } else { // accelerator (only the top heats), or someone who uses it all: search on the model
       const max = minutesToStat(S0);
       if (inRow(0) === who.length) { minutes = 0; withHeater = who.length; }
       else if (inRow(max) < who.length) { minutes = max; withHeater = inRow(max); }
@@ -714,9 +760,9 @@
   const isGeneric = (m) => m.id.startsWith('gen');
   const generic = () => fam.members.find(isGeneric);
   function anonShowers(S) {
-    if (accF() >= 1) return Math.floor(Math.max(0, (S.t - okEnd()) / perLiter()) / planNeed(generic()));
+    if (accF() >= 1) return Math.floor(Math.max(0, (S.t - okEnd()) / perLiter()) / selfNeed(generic()));
     let n = 0;
-    for (; n < 30; n++) { const D = drawS(S, planNeed(generic())); if (D.end < okEnd()) break; S = D.S; }
+    for (; n < 30; n++) { const D = drawS(S, selfNeed(generic())); if (D.end < okEnd()) break; S = D.S; }
     return n;
   }
 
@@ -760,7 +806,7 @@
     let S = p.S0;
     const rows = p.rows.map(r => {
       if (accF() >= 1) { // one volume: heat to exactly what this person needs (or the thermostat)
-        const d = planDraw(r.m), need0 = okEnd() + d;
+        const d = selfNeed(r.m) * perLiter(), need0 = okEnd() + d;
         let T = S.t, min = 0, capped = false;
         if (T < need0 - 0.05) {
           const target = Math.min(need0, Math.max(stat(), T));
@@ -768,11 +814,11 @@
           capped = target < tsh() + d - 0.05; // not even hot to the end at the thermostat
           T = target;
         }
-        S = tank(Math.max(tin(), T - d));
+        S = tank(Math.max(tin(), T - planDraw(r.m))); // someone who uses it all leaves it empty
         return Object.assign({}, r, { min, capped });
       }
-      const { min, capped } = minutesFor(S, planNeed(r.m));
-      S = drawS(heatS(S, min), planNeed(r.m)).S;
+      const { min, capped } = minutesFor(S, selfNeed(r.m));
+      S = showerOf(heatS(S, min), r.m).S;
       return Object.assign({}, r, { min, capped });
     });
     return { p, rows, total: rows.reduce((s, r) => s + r.min, 0) };
@@ -786,7 +832,7 @@
       const first = p.rows.slice(0, i + 1).map(x => x.m);
       const okAll = (min) => {
         let s = heatS(p.S0, min);
-        for (const m of first) { const D = drawS(s, planNeed(m)); if (D.end < okEnd() - 0.05) return false; s = D.S; }
+        for (const m of first) { const D = showerOf(s, m); if (D.end < okEnd() - 0.05) return false; s = D.S; }
         return true;
       };
       if (okAll(0)) return Object.assign({}, r, { min: 0, capped: false });
@@ -817,7 +863,7 @@
     const ok = (lead) => {
       let S = heatS(he.p.S0, lead);
       for (const r of rows) {
-        const D = drawS(heatS(S, planNeed(r.m) / FLOW), planNeed(r.m)); // heating on during the shower, up to the thermostat
+        const D = showerOf(heatS(S, planNeed(r.m) / FLOW), r.m); // heating on during the shower, up to the thermostat
         if (D.end < okEnd() - 0.05) return false;
         S = D.S;
       }
@@ -868,7 +914,7 @@
       const extra = moves.map(mv => ({ t: mv.t, member: mv.m.id, outcome: 'planned' }));
       const p = plan(tEve, 'evening', extra, new Set([...away, ...moves.map(mv => mv.m.id)]));
       // each moved person needs a hot shower at their hour too
-      const middayOk = moves.filter(mv => drawS(run(mv.t, extra.filter(e => e.t < mv.t)).S, planNeed(mv.m)).end >= okEnd() - 0.05).length;
+      const middayOk = moves.filter(mv => showerOf(run(mv.t, extra.filter(e => e.t < mv.t)).S, mv.m).end >= okEnd() - 0.05).length;
       return { hot: ok(p) + middayOk, middayOk, moves };
     };
     const candidates = base.rows.map(r => r.m);
@@ -1110,9 +1156,14 @@
         if (done.has(m.id)) return `<li class="ok"><button type="button" data-away="${m.id}" aria-pressed="false" disabled><span class="dot">${CHECK}</span>${esc(m.name)}<span class="st">כבר התקלח/ה</span></button></li>`;
         if (!r) return `<li class="away"><button type="button" data-away="${m.id}" aria-pressed="true"><span class="dot"></span>${esc(m.name)}<span class="st">${sh.isNow ? 'לא עכשיו' : 'לא הערב'}</span></button></li>`;
         const st = !r.min ? (on ? 'מספיק כבר' : 'בלי דוד') : `${on ? 'עוד' : '🔌'} ${ltr(r.min)} דק׳${r.capped ? ' (גם אז לא עד הסוף)' : ''}`;
-        return `<li class="${r.min ? 'heat' : 'ok'}"><button type="button" data-away="${m.id}" aria-pressed="false"><span class="dot">${r.min ? '' : CHECK}</span>${esc(m.name)}<span class="st">${st}</span></button></li>`;
+        return `<li class="${r.min ? 'heat' : 'ok'}"><button type="button" data-away="${m.id}" aria-pressed="false"><span class="dot">${r.min ? '' : CHECK}</span>${esc(m.name)}${isElastic(m) ? ' <span aria-label="מתקלח/ת עד שהמים החמים נגמרים">⏳</span>' : ''}<span class="st">${st}</span></button></li>`;
       };
+      // someone who uses up the hot water, with others still to shower after them: they'd better go last
+      const order = (kept || he.rows).map(r => r.m);
+      const notLast = order.filter((m, i) => isElastic(m) && order.slice(i + 1).some(x => !isElastic(x)));
+      const elasticNote = order.some(isElastic) ? `<p class="note">⏳ ${order.filter(isElastic).map(m => esc(m.name)).join(' ו')} בדרך כלל ${order.filter(isElastic).length > 1 ? 'מתקלחים' : 'מתקלח/ת'} עד שהמים החמים נגמרים, אז הדקות ${order.filter(isElastic).length > 1 ? 'שלהם' : 'כאן'} מחושבות למקלחת רגילה – עוד דוד רק יאריך אותה.${notLast.length ? ` <b>כדאי ש${notLast.map(m => esc(m.name)).join(' ו')} ${notLast.length > 1 ? 'יתקלחו אחרונים' : 'יתקלח/תתקלח אחרון/ה'}</b>, כדי שיישארו מים חמים לאחרים.` : ''} <a class="why" href="faq.html#uses-it-all">למה?</a></p>` : '';
       body = `<ul class="people">${slotPeople(sh.slot).map(item).join('')}</ul>
+        ${elasticNote}
         ${on ? (tn.total ? keepOnAdvice(kept) : '')
           : he.total ? `<p class="advice warn">🔌 כל אחד מדליק את הדוד לפני המקלחת שלו, לפי הדקות שליד השם – סה״כ כ-${ltr(he.total)} דקות.${why('heat-each-or-all')}</p>` : ''}
         ${on ? '' : (() => { const th = heatThrough(he); return th && he.total - th.lead >= 5 ? `<p class="note">אפשר גם להדליק כ-${ltr(th.lead)} דקות לפני המקלחת הראשונה ולהשאיר דלוק עד שכולם מתקלחים ברצף: הדוד ממשיך לחמם בזמן המקלחות, אז כולם מסיימים כ-${ltr(he.total - th.lead)} דקות מוקדם יותר. החשמל כמעט זהה (כ-${ltr(th.total)} דקות דוד) – אבל מים חמים "שלא נגמרים" נוטים להאריך מקלחות.</p>` : ''; })()}
@@ -1261,6 +1312,7 @@
   function renderSheet() {
     const w = $('sheet');
     if (!sheet.kind || !wx) { w.hidden = true; w.innerHTML = ''; document.body.style.overflow = ''; return; }
+    findElastic();
     const now = Date.now();
     let html;
     if (sheet.done) html = doneHtml(now);
@@ -1415,6 +1467,7 @@
     renderWelcome(Date.now());
     renderActions(Date.now());
     if (!wx) { root.innerHTML = ''; ['summary', 'tips', 'tankSlot'].forEach(id => { $(id).innerHTML = ''; }); placeHome(); return; }
+    findElastic();
     const now = Date.now();
     const nowRun = run(now), cur = nowRun.T, curS = nowRun.S;
     const morning = nextAt(cfg.morning, now);
@@ -1496,7 +1549,7 @@
       ${fam.members.length ? `<table class="members"><thead><tr><th>שם</th><th>מדוד חם למקלחת</th><th>בוקר</th><th>ערב</th><th></th><th></th></tr></thead><tbody>
         ${fam.members.map((m, i) => `<tr data-id="${m.id}">
           <td><input class="m-name" value="${esc(m.name)}" aria-label="שם"></td>
-          <td>${ltr('~' + share(m) + '%')}<div class="note">${m.n ? `נלמד מ-${ltr(m.n)}` : 'עדיין הערכה'}</div></td>
+          <td>${ltr('~' + share(m) + '%')}<div class="note">${m.n ? `נלמד מ-${ltr(m.n)}` : 'עדיין הערכה'}${isElastic(m) ? '<br>⏳ מתקלח/ת עד שהמים החמים נגמרים – ההמלצות לפי מקלחת רגילה' : ''}</div></td>
           <td><input class="m-slot" data-slot="morning" type="checkbox" ${m.skip?.morning ? '' : 'checked'} aria-label="מתקלח בבוקר"></td>
           <td><input class="m-slot" data-slot="evening" type="checkbox" ${m.skip?.evening ? '' : 'checked'} aria-label="מתקלח בערב"></td>
           <td><button type="button" class="x" data-up="${i}" ${i ? '' : 'disabled'} aria-label="הזזה למעלה">▲</button></td>
