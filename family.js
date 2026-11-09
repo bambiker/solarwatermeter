@@ -1376,7 +1376,9 @@
           ${eve.rows.length ? keepOnAdvice(kept) : adviceHtml(eve, true)}
           <button type="button" class="big-btn primary" data-sheet-boil-off>כיביתי את הדוד</button>`
         : `<h2>הדלקתם את הדוד? לכמה זמן?</h2>
-          ${each.length ? `<p class="k">להדליק לפני המקלחת של:</p><div class="outs">${each.map(r => `<button type="button" data-sheet-boil="${r.min}" data-who2="${esc(r.m.name)}"><span>🔌 ${esc(r.m.name)} – ${ltr(r.min)} דק׳${r.capped ? ' (גם אז לא עד הסוף)' : ''}</span></button>`).join('')}</div>
+          ${each.length ? `<p class="k">להדליק לפני המקלחת של:</p><div class="outs">${each.map(r => `<button type="button" data-sheet-boil="${r.min}" data-who2="${esc(r.m.name)}"><span>🔌 ${esc(r.m.name)} – ${ltr(r.min)} דק׳${r.capped ? ' (גם אז לא עד הסוף)' : ''}</span></button>`).join('')}${
+            // once for everyone, then all shower one after another (the thermostat may stop it short of everyone)
+            eve.rows.length > 1 && eve.minutes > 0 ? `<button type="button" data-sheet-boil="${eve.minutes}" data-who2="כולם"><span>🔌 לכולם ברצף – ${ltr(eve.minutes)} דק׳${eve.withHeater < eve.total ? ` (יספיק ל-${ltr(eve.withHeater)} מתוך ${ltr(eve.total)})` : ''}</span></button>` : ''}</div>
             <p class="k">או לבחור זמן:</p>`
             : eve.rows.length ? '<p class="advice ok">✅ הערב יספיק לכולם בלי דוד</p>' : ''}
           <div class="boil-grid">${[10, 20, 30, 45, 60, 90].map(m => `<button type="button" data-sheet-boil="${m}">${ltr(m)} דק׳</button>`).join('')}
