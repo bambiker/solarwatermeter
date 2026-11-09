@@ -965,28 +965,59 @@
   // Against it: the electricity the boiler actually used (logged runs × element power). Conservative – it
   // leaves out unlogged showers and the tank losses an electric-only boiler would also pay for.
   const SHOWER_SHARE = { plenty: 1, edge: 1, full: 1, partial: 0.5, none: 0 };
-  function savings(from, now) {
-    const logs = fam.logs.filter(l => l.t >= from && l.t <= now && SHOWER_SHARE[l.outcome] != null);
-    const needKwh = logs.reduce((s, l) => {
+  // Savings are kept day by day, and a day's figure only grows: needed − used, but never below zero (heat kept
+  // over for the next day isn't the sun's loss). Days that are over go into a ledger on this device and stay as
+  // they were – later learning (someone turns out to use less) doesn't shrink savings already made – unless
+  // that day's own log changes (a shower or a run added, removed or edited later). Today, the boiler counts only
+  // up to the last shower logged: heat for showers still to come isn't held against them yet.
+  const LEDGER = 'hwm.savedDays';
+  const hash = (str) => { let h = 5381; for (let i = 0; i < str.length; i++) h = (h * 33 + str.charCodeAt(i)) >>> 0; return h.toString(36); };
+  function dayLog(day, now) {
+    const start = Date.parse(day + 'T00:00:00Z') - wx.off, end = start + DAY;
+    const logs = fam.logs.filter(l => l.t >= start && l.t < end && l.t <= now && SHOWER_SHARE[l.outcome] != null);
+    const runs = fam.boilers.filter(b => b.t < end && runEnd(b, now) > start);
+    return { start, end, logs, runs, sig: hash(logs.map(l => l.id + l.outcome + l.member).join() + '|' + runs.map(b => b.id + b.t + ':' + b.min).join()) };
+  }
+  function dayKwh(d, upTo, now) {
+    const needed = d.logs.reduce((s, l) => {
       const air = airAt(l.t);
       return s + SHOWER_SHARE[l.outcome] * need(member(l.member)) * Math.max(0, tsh(air) - tin(air)) * CP / 3600;
     }, 0);
-    const runs = fam.boilers.filter(b => runEnd(b, now) > from && b.t <= now);
-    const usedKwh = runs.reduce((s, b) => s + (Math.min(runEnd(b, now), now) - Math.max(b.t, from)) / HOUR * cfg.heaterKw, 0);
-    return { showers: logs.length, runs: runs.length, needKwh, usedKwh, money: Math.max(0, needKwh - usedKwh) * cfg.kwhPrice };
+    const until = Math.min(d.end, upTo);
+    const used = d.runs.reduce((s, b) => s + Math.max(0, Math.min(runEnd(b, now), until) - Math.max(b.t, d.start)) / HOUR * cfg.heaterKw, 0);
+    return { need: +needed.toFixed(3), used: +used.toFixed(3), n: d.logs.length };
+  }
+  function savingDays(now) {
+    const today = localStr(now).slice(0, 10);
+    const days = [...new Set(fam.logs.filter(l => l.t <= now && SHOWER_SHARE[l.outcome] != null).map(l => localStr(l.t).slice(0, 10)))].sort();
+    const ledger = store.get(LEDGER, {});
+    let changed = false;
+    const out = days.map(day => {
+      const d = dayLog(day, now);
+      if (day === today) return Object.assign({ day }, dayKwh(d, Math.max(...d.logs.map(l => l.t)) + 1, now));
+      const kept = ledger[day];
+      if (kept && kept.sig === d.sig) return Object.assign({ day }, kept);
+      ledger[day] = Object.assign({ sig: d.sig }, dayKwh(d, Infinity, now));
+      changed = true;
+      return Object.assign({ day }, ledger[day]);
+    });
+    if (changed) store.set(LEDGER, ledger);
+    return out;
+  }
+  function savings(days) {
+    const sum = (f) => days.reduce((s, d) => s + f(d), 0);
+    return { showers: sum(d => d.n), needKwh: sum(d => d.need), usedKwh: sum(d => d.used), money: sum(d => Math.max(0, d.need - d.used)) * cfg.kwhPrice };
   }
   const shekels = (x) => `${fmt(x, x < 10 ? 1 : 0)} ₪`;
   function savingsHtml(now) {
-    const first = Math.min(...fam.logs.filter(l => l.outcome !== 'planned').map(l => l.t));
-    if (!isFinite(first) || fam.logs.length < 3) return '';
-    const month = savings(now - 30 * DAY, now), all = savings(first, now);
-    const since = localStr(first).slice(0, 10).split('-').reverse().slice(0, 2).join('.');
-    const fresh = first >= now - 30 * DAY; // everything is from the last month anyway
+    const days = savingDays(now);
+    if (!days.length || fam.logs.length < 3) return '';
+    const all = savings(days);
+    const since = days[0].day.split('-').reverse().slice(0, 2).join('.');
     return `<section class="card know money">
       <div class="know-h">💰 השמש חסכה לכם</div>
       <div class="money-row">
-        ${fresh ? '' : `<div><b>${shekels(month.money)}</b><span>בחודש האחרון</span></div>`}
-        <div><b>${shekels(all.money)}</b><span>מאז שהתחלתם לרשום (${ltr(since)})</span></div>
+        <div><b>${shekels(all.money)}</b><span>מאז שהתחלתם להשתמש (${ltr(since)})</span></div>
       </div>
       <p class="note">לעומת דוד חשמלי בלבד: ${ltr(all.showers)} המקלחות שנרשמו צריכות כ-${ltr(fmt(all.needKwh, 0))} קוט״ש, ובפועל הדוד החשמלי עבד כ-${ltr(fmt(all.usedKwh, 0))} קוט״ש. לפי ${ltr(fmt(cfg.kwhPrice, 2))} ₪ לקוט״ש. <a href="faq.html#savings">איך מחשבים?</a></p>
     </section>`;
