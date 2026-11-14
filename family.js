@@ -28,8 +28,9 @@
     heaterMax: 65,    // electric element thermostat °C (Israeli practice: 65; factory default often 70)
     tankMax: 80,      // highest the sun can take the tank (no solar limiter: ~80 on a hot idle day)
     perPerson: 40,    // default liters of shower-temperature water per shower
-    morning: '07:00',
-    evening: '19:00',
+    morning: '07:00', // shower times set by hand – used until there are enough showers to learn them,
+    evening: '19:00', // or always if autoTimes is off
+    autoTimes: true,
     kwhPrice: 0.6352, // ₪ per kWh, Israeli home tariff incl. VAT (July 2026) – for the savings card
     accel: 'auto',    // a heating accelerator (the element heats only the top part): true / false / 'auto' = detect
     accelFound: null, // what detection found: true / false / null = not enough data yet
@@ -779,7 +780,37 @@
   // ---------- Showers tonight (the family's own measure: their tank, their people, the season) ----------
   // Who won't shower this evening (away, showered at the pool, back very late): set by tapping a name,
   // kept on this device for that evening only
-  const tonightAt = (now) => nextAt(cfg.evening, now - 3 * HOUR); // "tonight" until 3 hours after the evening showers
+  // ---------- When this family showers: learned from the log ----------
+  // The median time each day's first evening (or morning) shower started, over the last 30 days, once there are
+  // 3 such days; times after midnight belong to the evening before. Until then – or if turned off – the set times.
+  let timesCache = { key: '', v: {} };
+  function learnedTime(slot) {
+    if (!wx) return null;
+    const now = Date.now(), key = fam.logs.length + '|' + Math.floor(now / HOUR);
+    if (timesCache.key !== key) timesCache = { key, v: {} };
+    if (slot in timesCache.v) return timesCache.v[slot];
+    const first = {};
+    fam.logs.forEach(l => {
+      if (l.t > now || now - l.t > 30 * DAY || l.outcome === 'planned') return;
+      const s = localStr(l.t);
+      let min = +s.slice(11, 13) * 60 + +s.slice(14, 16), day = s.slice(0, 10);
+      const evening = min >= 12 * 60 || min < 4 * 60;
+      if ((slot === 'evening') !== evening) return;
+      if (min < 4 * 60) { min += 24 * 60; day = localStr(l.t - DAY).slice(0, 10); }
+      if (first[day] == null || min < first[day]) first[day] = min;
+    });
+    const mins = Object.values(first).sort((a, b) => a - b);
+    let v = null;
+    if (mins.length >= 3) {
+      let m = Math.round(mins[Math.floor(mins.length / 2)] / 15) * 15;
+      m = slot === 'evening' ? Math.min(m, 23 * 60 + 45) : Math.max(4 * 60, Math.min(m, 11 * 60 + 45));
+      v = String(Math.floor(m / 60)).padStart(2, '0') + ':' + String(m % 60).padStart(2, '0');
+    }
+    return (timesCache.v[slot] = v);
+  }
+  const slotTime = (slot) => (cfg.autoTimes !== false && learnedTime(slot)) || cfg[slot];
+
+  const tonightAt = (now) => nextAt(slotTime('evening'), now - 3 * HOUR); // "tonight" until 3 hours after the evening showers
   function awayTonight(now) {
     const a = store.get('hwm.away', null);
     return new Set(a && a.d === localStr(tonightAt(now)).slice(0, 10) ? a.ids : []);
@@ -803,9 +834,9 @@
   function heroTarget(now) {
     const day0 = dayStart(now);
     const at = (hm) => { const [h, m] = hm.split(':').map(Number); return day0 + h * HOUR + m * 60000; };
-    if (now >= at(cfg.evening) || now < at(cfg.morning) + 2 * HOUR)
+    if (now >= at(slotTime('evening')) || now < at(slotTime('morning')) + 2 * HOUR)
       return { t: now, now: true, slot: now - day0 >= 12 * HOUR ? 'evening' : 'morning' };
-    return { t: at(cfg.evening), now: false, slot: 'evening' };
+    return { t: at(slotTime('evening')), now: false, slot: 'evening' };
   }
 
   // Heating for each person separately, right before their own shower: just enough for them, in the
@@ -908,7 +939,7 @@
   // isn't enough for everyone, try moving one or two people to a midday hour and keep the move
   // that gives the most hot showers overall; for equal results prefer the latest (most convenient) hour.
   function timingTip(now) {
-    const tEve = nextAt(cfg.evening, now - 3 * HOUR);
+    const tEve = nextAt(slotTime('evening'), now - 3 * HOUR);
     if (tEve - now > 12 * HOUR) return null;
     const away = awayTonight(now);
     const base = plan(tEve, 'evening', [], away);
@@ -950,7 +981,7 @@
   let tipCache = { key: '', tip: null };
   function timingTipHtml(now) {
     const key = JSON.stringify([Math.floor(now / (15 * 60000)), [...awayTonight(now)], fam.logs.length, fam.boilers, fam.members.map(m => [m.id, need(m), m.skip]),
-      cfg.eff, cfg.tau, cfg.heaterEff, cfg.evening, wx.hours.length, wx.hours[0].start]);
+      cfg.eff, cfg.tau, cfg.heaterEff, slotTime('evening'), wx.hours.length, wx.hours[0].start]);
     if (tipCache.key !== key) tipCache = { key, tip: timingTip(now) };
     const tip = tipCache.tip;
     if (!tip) return '';
@@ -1514,8 +1545,8 @@
     findElastic();
     const now = Date.now();
     const nowRun = run(now), cur = nowRun.T, curS = nowRun.S;
-    const morning = nextAt(cfg.morning, now);
-    const evening = nextAt(cfg.evening, now);
+    const morning = nextAt(slotTime('morning'), now);
+    const evening = nextAt(slotTime('evening'), now);
     const slots = [['עכשיו', now, 'now'], ['בוקר', morning, 'morning'], ['ערב', evening, 'evening']]
       .filter(s => s[1] <= wx.hours[wx.hours.length - 1].end)
       .sort((a, b) => a[1] - b[1]);
@@ -1639,8 +1670,12 @@
       <summary>${sync.conf ? '⚙️ הגדרות המשפחה והדוד' : '⚙️ הגדרות הדוד'}</summary>
       ${sync.conf ? '<div class="home-loc"><div class="k">📍 מיקום הבית – משותף לכל המשפחה</div><div id="locSlot"></div></div>' : ''}
       <div class="grid-inputs">
-        <label>שעת מקלחות בוקר<input data-cfg="morning" type="time" value="${cfg.morning}"></label>
-        <label>שעת מקלחות ערב<input data-cfg="evening" type="time" value="${cfg.evening}"></label>
+        <label class="chk"><input data-cfg="autoTimes" type="checkbox" ${cfg.autoTimes !== false ? 'checked' : ''}> ללמוד לבד מתי מתקלחים (לפי המקלחות שנרשמו)</label>
+        ${['morning', 'evening'].map(slot => {
+          const auto = cfg.autoTimes !== false, got = auto && learnedTime(slot);
+          return `<label>שעת מקלחות ${slot === 'morning' ? 'בוקר' : 'ערב'}<input data-cfg="${slot}" type="time" value="${got || cfg[slot]}" ${got ? 'disabled' : ''}>
+            <span class="note">${got ? 'נלמד מהמקלחות שנרשמו' : auto ? 'עוד אין מספיק מקלחות ללמוד – בינתיים לפי השעה כאן' : ''}</span></label>`;
+        }).join('')}
         <label>מחיר חשמל (₪ לקוט״ש, כולל מע״מ)<input data-cfg="kwhPrice" type="number" min="0.1" max="5" step="0.01" value="${cfg.kwhPrice}"></label>
         <label>מאיץ חימום (הדוד החשמלי מחמם רק את החלק העליון)<select data-cfg="accel">${[['auto', 'לא יודע – האתר יזהה לבד'], ['yes', 'יש'], ['no', 'אין']]
           .map(([v, t]) => `<option value="${v}" ${(cfg.accel === true ? 'yes' : cfg.accel === false ? 'no' : 'auto') === v ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
