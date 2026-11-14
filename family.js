@@ -36,6 +36,7 @@
     accelEvidence: 0, // long boiler runs followed by 2+ showers seen at the last check
     accelCheckedAt: null,
     accFrac: 0.35,    // …that part, as a share of the tank (learned; nobody needs to know the tank's size)
+    tauMonths: null,  // learned cooling time per past month (0 = the last 30 days), as of driftAt
     effMonths: null,  // learned sun / element factor per past month (0 = the last 30 days), as of driftAt
     heatMonths: null,
     driftAt: null
@@ -560,7 +561,7 @@
   // drift: per-month factors { eff: [], heat: [] } (index 0 = the last 30 days); without it, today's for all
   function tempsBeforeShowers(P, drift) {
     const H = wx.hours, logs = P.logs, out = [];
-    const decay = Math.exp(-0.25 / cfg.tau);
+    const decays = drift && drift.tau ? drift.tau.map(t => Math.exp(-0.25 / t)) : null, decay = Math.exp(-0.25 / cfg.tau);
     let S = tank(20), li = 0;
     try {
       for (let s = 0; s < P.n; s++) {
@@ -569,7 +570,7 @@
         if (P.reset[s]) S = tank((h.ta ?? tin()) + 5);
         while (li < P.logEnd[s]) { out.push({ S, air: h.air }); S = applyLog(S, logs[li]); li++; }
         const b = P.blk[s];
-        S = stepS(S, h, 0.25, P.on[s], drift ? drift.eff[b] : cfg.eff, drift ? drift.heat[b] : cfg.heaterEff, decay).S;
+        S = stepS(S, h, 0.25, P.on[s], drift ? drift.eff[b] : cfg.eff, drift ? drift.heat[b] : cfg.heaterEff, decays ? decays[b] : decay).S;
       }
     } finally { seasonAir = null; }
     while (out.length < logs.length) out.push({ S, air: airMean() });
@@ -581,6 +582,8 @@
   // How well the collectors and the element work may change from month to month (each month has its own
   // value, kept close to its neighbours); people's habits and the tank are taken as steady, recent showers
   // counting more.
+  // the cooling moves between months only on clear evidence (freer, it soaked up other misfits)
+  const TAU_DRIFT_WEIGHT = 60; // tested: 6 lost 3 of 36 hot showers on the accelerator check, 60 kept it, and still learned the cold
   const HISTORY = 365 * DAY, HALF_LIFE = 90 * DAY, MIN_WEIGHT = 0.25, BLOCK = 30 * DAY, DRIFT_WEIGHT = 6;
   const weight = (l, now) => Math.max(MIN_WEIGHT, Math.pow(0.5, (now - l.t) / HALF_LIFE));
 
@@ -626,11 +629,15 @@
     const since = cfg.driftAt ? Math.round((now - cfg.driftAt) / BLOCK) : 0;
     const start = (saved, today) => Array.from({ length: P.blocks }, (_, b) =>
       !b ? today : (saved && saved.length ? saved[Math.min(saved.length - 1, Math.max(0, b - since))] : today));
-    const drift = { eff: start(cfg.effMonths, cfg.eff), heat: start(cfg.heatMonths, cfg.heaterEff) };
+    const drift = { eff: start(cfg.effMonths, cfg.eff), heat: start(cfg.heatMonths, cfg.heaterEff), tau: start(cfg.tauMonths, cfg.tau) };
     const knob = (get, set, prior, lo, hi, group) => ({ get, set, prior, lo, hi, group });
     const monthly = (arr, prior, lo, hi, group) => arr.map((_, b) => knob(() => arr[b], v => { arr[b] = v; }, b ? null : prior, lo, hi, group));
     const sun = monthly(drift.eff, DEFAULTS.eff, 0.15, 1.5, 'sun');
-    const knobs = [...sun, knob(() => cfg.tau, v => { cfg.tau = v; }, DEFAULTS.tau, 10, 150)];
+    // cooling per month too: a tank on a cold, windy roof loses heat faster in winter (tested on a summer →
+    // autumn family: one value for the year learned 72 h where the truth was 23, and once promised a hot
+    // shower that ran out; per month it learned 45 h and missed none)
+    const cool = monthly(drift.tau, DEFAULTS.tau, 10, 150, 'cool');
+    const knobs = [...sun, ...cool];
     const elec = fam.boilers.some(b => runEnd(b, now) > wx.hours[0].start) ? monthly(drift.heat, DEFAULTS.heaterEff, 0.3, 2, 'elec') : [];
     knobs.push(...elec);
     // with an accelerator: how much of the tank its element heats (shows after long runs: more minutes stop helping)
@@ -643,14 +650,14 @@
     // Directions to search: each factor alone, plus factors that can stand in for each other moved
     // together (every month's sun; sun + boiler heating; everyone's usage), or the search stalls where one compensates
     const moves = knobs.map(k => [k]);
-    for (const ks of [sun, elec, [...sun, ...elec], knobs.filter(k => k.group === 'use')]) if (ks.length > 1) moves.push(ks);
+    for (const ks of [sun, elec, [...sun, ...elec], knobs.filter(k => k.group === 'use'), cool.length > 1 ? cool : []]) if (ks.length > 1) moves.push(ks);
     // a bigger heated part with a stronger element warms the top at the same pace: try them together too
     if (acc.length) moves.push([...acc, ...elec]);
     // the prior pulls today's values (and tau, and each person) toward the defaults; neighbouring months toward each other
     const smooth = (arr) => arr.reduce((s, v, b) => s + (b ? sq(Math.log(v / arr[b - 1])) : 0), 0);
     const cost = () => negLogLik(P, now, drift)
       + PRIOR_WEIGHT * knobs.reduce((s, k) => s + (k.prior ? sq(Math.log(k.get() / k.prior)) : 0), 0)
-      + DRIFT_WEIGHT * (smooth(drift.eff) + (elec.length ? smooth(drift.heat) : 0));
+      + DRIFT_WEIGHT * (smooth(drift.eff) + (elec.length ? smooth(drift.heat) : 0)) + TAU_DRIFT_WEIGHT * smooth(drift.tau);
     // Multiplicative coordinate search, coarse to fine
     let best = cost();
     for (const f of [1.6, 1.25, 1.08, 1.02]) {
@@ -669,10 +676,13 @@
     }
     fitCost = best;
     cfg.eff = drift.eff[0];
+    if (drift.tau) cfg.tau = drift.tau[0];
     if (elec.length) cfg.heaterEff = drift.heat[0];
     const r3 = (arr) => arr.map(v => +v.toFixed(3));
     Object.assign(cfg, { effMonths: r3(drift.eff), heatMonths: r3(drift.heat), driftAt: now });
+    if (drift.tau) cfg.tauMonths = drift.tau.map(v => +v.toFixed(1));
     const ops = [{ op: 'cfg', cfg: { eff: +cfg.eff.toFixed(3), tau: +cfg.tau.toFixed(1), heaterEff: +cfg.heaterEff.toFixed(3), effMonths: cfg.effMonths, heatMonths: cfg.heatMonths, driftAt: now } }];
+    if (drift.tau) ops[0].cfg.tauMonths = cfg.tauMonths;
     if (acc.length) ops[0].cfg.accFrac = +cfg.accFrac.toFixed(2);
     for (const m of fam.members) {
       const n = logs.filter(l => l.member === m.id).length;
@@ -1700,17 +1710,19 @@
     const at = cfg.driftAt || Date.now();
     const eff = cfg.effMonths && cfg.effMonths.length ? cfg.effMonths : [cfg.eff];
     const heat = cfg.heatMonths && cfg.heatMonths.length ? cfg.heatMonths : [cfg.heaterEff];
+    const cool = cfg.tauMonths && cfg.tauMonths.length ? cfg.tauMonths : [cfg.tau];
     const elec = fam.boilers.length > 0;
+    const hours = (tau) => ltr(Math.round(tau * Math.LN2) + ' ש׳');
     const day = (t) => localStr(t).slice(5, 10).split('-').reverse().join('.');
     const bar = (r) => `<span class="mbar"><i style="width:${Math.min(100, r * 50).toFixed(0)}%"></i></span> ${ltr(Math.round(r * 100) + '%')}`;
     const rows = eff.map((e, b) => `<tr><td>${b ? `${ltr(day(at - (b + 1) * BLOCK))}–${ltr(day(at - b * BLOCK))}` : '30 הימים האחרונים'}</td>
-      <td>${bar(e / DEFAULTS.eff)}</td>${elec ? `<td>${bar((heat[b] ?? heat[heat.length - 1]) / DEFAULTS.heaterEff)}</td>` : ''}</tr>`).join('');
+      <td>${bar(e / DEFAULTS.eff)}</td>${elec ? `<td>${bar((heat[b] ?? heat[heat.length - 1]) / DEFAULTS.heaterEff)}</td>` : ''}<td>${hours(cool[b] ?? cool[cool.length - 1])}</td></tr>`).join('');
     return `<div class="learned-box">
       <h3>🧠 מה האתר למד על הדוד</h3>
       <p class="note">כמה מהר הדוד שלכם מתחמם בכל חודש, ביחס לדוד ממוצע (<span dir="ltr">100%</span>). ירידה יכולה לרמז על קולטים מאובקים או אבנית בגוף החימום; עלייה – למשל אחרי גשם שניקה את הקולטים. כשבחודש האחרון החימום יורד בחמישית (20%) או יותר לעומת החודשים הקודמים, מופיעה התראה בלשונית "היום". <a href="faq.html#faults">איך זה עובד?</a></p>
-      <table class="months"><thead><tr><th>תקופה</th><th>מהשמש</th>${elec ? '<th>מהדוד החשמלי</th>' : ''}</tr></thead><tbody>${rows}</tbody></table>
+      <table class="months"><thead><tr><th>תקופה</th><th>מהשמש</th>${elec ? '<th>מהדוד החשמלי</th>' : ''}<th>שומר חום</th></tr></thead><tbody>${rows}</tbody></table>
       <p class="note">${accelNote()}</p>
-      <p class="note">שמירת חום: חצי מהחום שמעל טמפ׳ האוויר נשאר בדוד אחרי כ-${ltr(Math.round(cfg.tau * Math.LN2))} שעות. כמה כל אחד צורך – בלשונית "משפחה".${cfg.effMonths ? '' : ' (הפירוט לפי חודשים יופיע אחרי הלמידה הבאה.)'}</p>
+      <p class="note">"שומר חום": אחרי כמה שעות נשאר בדוד חצי מהחום שמעל טמפ׳ האוויר – בחורף, על גג קר ובמקום עם רוח, זה פחות. כמה כל אחד צורך – בלשונית "משפחה".${cfg.effMonths ? '' : ' (הפירוט לפי חודשים יופיע אחרי הלמידה הבאה.)'}</p>
     </div>`;
   }
 
@@ -1977,7 +1989,7 @@
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     } else if (b.id === 'resetLearn') {
       if (!confirm('לאפס את מה שנלמד (ליטרים לכל אחד וכיול הדוד)? יומן המקלחות יישמר.')) return;
-      commit([...fam.members.map(m => ({ op: 'member', m: { id: m.id, liters: null, n: 0 } })), { op: 'cfg', cfg: { eff: DEFAULTS.eff, heaterEff: DEFAULTS.heaterEff, tau: DEFAULTS.tau, effMonths: null, heatMonths: null, driftAt: null } }]);
+      commit([...fam.members.map(m => ({ op: 'member', m: { id: m.id, liters: null, n: 0 } })), { op: 'cfg', cfg: { eff: DEFAULTS.eff, heaterEff: DEFAULTS.heaterEff, tau: DEFAULTS.tau, effMonths: null, heatMonths: null, tauMonths: null, driftAt: null } }]);
     } else if (b.id === 'connectBtn') {
       b.disabled = true; b.textContent = 'מתחבר…';
       connect($('syncUrl').value, $('syncKey').value);
