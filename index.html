@@ -504,7 +504,7 @@
     $('status').classList.remove('err');
     const url = (tilt, az) => 'https://api.open-meteo.com/v1/forecast?latitude=' + loc.lat + '&longitude=' + loc.lon +
       '&hourly=global_tilted_irradiance,shortwave_radiation,cloud_cover,temperature_2m&tilt=' + tilt + '&azimuth=' + az +
-      '&past_days=92&forecast_days=2&timezone=auto'; // 3 months back (the most the forecast gives): the family model learns from it
+      '&past_days=92&forecast_days=2&timezone=auto&timeformat=unixtime'; // 3 months back (the most the forecast gives): the family model learns from it
     const get = async (u) => { const r = await fetch(u); if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); };
     try {
       // the index uses the standard collector; the tank model needs the family's own orientation
@@ -512,12 +512,26 @@
       const [data, own] = await Promise.all([get(url(STD.tilt, STD.az)),
         tilt === STD.tilt && az === STD.az ? null : get(url(tilt, az))]);
       data.hourly.tank_gti = (own || data).hourly.global_tilted_irradiance;
+      localTimes(data);
       render(data);
       $('status').textContent = '';
     } catch (e) {
       $('status').textContent = 'שגיאה בטעינת הנתונים: ' + e.message;
       $('status').classList.add('err');
     }
+  }
+
+  // The hours come as UTC instants (unix): with local wall times, the hours before a change of clock
+  // (summer → winter time) would be read with today's offset and land an hour off. The local wall time of
+  // each hour is worked out here, in the location's own time zone.
+  function localTimes(data) {
+    const h = data.hourly;
+    if (!h.time.length || typeof h.time[0] !== 'number') return;
+    h.unix = h.time.map(t => t * 1000);
+    let fmt = null;
+    try { fmt = new Intl.DateTimeFormat('sv-SE', { timeZone: data.timezone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }); } catch {}
+    const off = data.utc_offset_seconds * 1000;
+    h.time = h.unix.map(t => fmt ? fmt.format(t).replace(' ', 'T') : new Date(t + off).toISOString().slice(0, 16));
   }
 
   function buildDays(data) {
@@ -538,7 +552,7 @@
     h.time.forEach((t, i) => {
       if (t.slice(0, 10) !== today && t.slice(0, 10) !== yday) return; // only the two days shown
       // t is local wall time "YYYY-MM-DDTHH:MM"; convert to a UTC instant
-      const endUtc = Date.parse(t + ':00Z') - off;
+      const endUtc = h.unix ? h.unix[i] : Date.parse(t + ':00Z') - off;
       const date = t.slice(0, 10);
       if (!byDate.has(date)) byDate.set(date, []);
       byDate.get(date).push({
@@ -849,7 +863,7 @@
   })();
 </script>
 <!-- ?v= changes with each release, so a phone never pairs a new page with an old cached script -->
-<script src="config.js?v=20261114b"></script>
-<script src="family.js?v=20261114b"></script>
+<script src="config.js?v=20261115a"></script>
+<script src="family.js?v=20261115a"></script>
 </body>
 </html>
