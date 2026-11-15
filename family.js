@@ -40,7 +40,8 @@
     tauMonths: null,  // learned cooling time per past month (0 = the last 30 days), as of driftAt
     effMonths: null,  // learned sun / element factor per past month (0 = the last 30 days), as of driftAt
     heatMonths: null,
-    driftAt: null
+    driftAt: null,
+    bg: 0             // hot water nobody logs (showers that weren't logged, dishes, hands), liters a day – learned
   };
   // Settings migrations. 2: tilted-collector irradiance with temperature-dependent losses, so
   // calibration learned under the old horizontal model starts again. 3: seasonal shower temperature.
@@ -291,7 +292,15 @@
   const STEP = HOUR / 4;
   // A run logged as "until I switch it off" counts up to now, and at most this long if nobody does
   const MAX_OPEN = 3 * HOUR;
-  const runEnd = (b, now) => b.min != null ? b.t + b.min * 60000 : Math.min(now, b.t + MAX_OPEN);
+  // A run left open past that most likely ended by the next logged shower (people switch it off to shower,
+  // and forget to say so): counting 3 hours of element made the tank look far hotter than it was
+  function runEnd(b, now) {
+    if (b.min != null) return b.t + b.min * 60000;
+    const end = Math.min(now, b.t + MAX_OPEN);
+    if (now < b.t + MAX_OPEN) return end; // may still be on
+    const next = fam.logs.reduce((t, l) => (l.t > b.t && l.t < t ? l.t : t), Infinity);
+    return Math.min(end, next);
+  }
   const spansOf = (now) => fam.boilers.map(b => [b.t, runEnd(b, now)]).filter(s => s[1] > s[0]);
   const overlap = (spans, a, b) => spans.reduce((sum, [x, y]) => sum + Math.max(0, Math.min(b, y) - Math.max(a, x)), 0);
   const activeRun = (now) => fam.boilers.find(b => b.t <= now && now < (b.min != null ? b.t + b.min * 60000 : b.t + MAX_OPEN));
@@ -427,7 +436,30 @@
     if (b > t) t = b = f * t + (1 - f) * b; // warmer water below rises: the layers mix
     return { S: { t, b }, sun };
   }
-  function step(S, h, a, b, spans) { return stepS(S, h, (b - a) / HOUR, overlap(spans, a, b) / HOUR).S; }
+  function step(S, h, a, b, spans) { return bgDraw(stepS(S, h, (b - a) / HOUR, overlap(spans, a, b) / HOUR).S, a, b); }
+
+  // ---------- Hot water nobody logs ----------
+  // Not every shower gets logged, and dishes and hands take hot water too. The site learns how much goes
+  // like that (liters a day) and takes it out evenly in the evening, when people are home and most of it
+  // goes – otherwise a tank that keeps losing more than the logged showers looks hotter than it is.
+  // (Showers that weren't logged but came in the usual evening round don't show up here – the plan counts
+  // everyone's shower anyway; tested: a family logging half its showers learned 0 L.)
+  const BG_FROM = 17, BG_HOURS = 7; // 17:00–24:00
+  // the share of a day's unlogged use between a and b
+  function bgShare(a, b) {
+    const d0 = dayStart(a);
+    let sum = 0;
+    for (let d = d0; d < b; d += DAY) {
+      const x = d + BG_FROM * HOUR, y = x + BG_HOURS * HOUR;
+      sum += Math.max(0, Math.min(b, y) - Math.max(a, x));
+    }
+    return sum / (BG_HOURS * HOUR);
+  }
+  function bgDraw(S, a, b, bg = cfg.bg) {
+    if (!(bg > 0)) return S;
+    const sh = bgShare(a, b);
+    return sh > 0 ? drawS(S, bg * sh).S : S;
+  }
 
   // A logged shower also corrects the simulated state: the answer says where the tank was (at the tap, at the
   // start and at the end of the shower), so the tank is first moved into that range – both layers alike – and
@@ -490,7 +522,7 @@
         const g = byDay[Math.floor((a + wx.off) / DAY)] ||= { total: 0, soFar: 0 };
         g.total += r.sun;
         if (b <= now) g.soFar += r.sun;
-        S = r.S;
+        S = bgDraw(r.S, a, b);
       }
     }
     } finally { seasonAir = null; }
@@ -537,7 +569,7 @@
   // simulating 3 days before its first one, by which time the tank has forgotten where it started.
   function simPlan(logs) {
     const H = wx.hours, spans = spansOf(Date.now());
-    const hi = [], on = [], reset = [], logEnd = [], blk = [], now = Date.now();
+    const hi = [], on = [], reset = [], logEnd = [], blk = [], bgs = [], now = Date.now();
     let li = 0, i = 0;
     while (li < logs.length) {
       const segStart = Math.max(H[0].start, logs[li].t - 3 * DAY);
@@ -547,7 +579,7 @@
         const h = H[i];
         for (let a = Math.max(h.start, Math.floor(segStart / STEP) * STEP); a < h.end; a += STEP) {
           while (li < logs.length && logs[li].t < a + STEP) li++;
-          hi.push(i); on.push(overlap(spans, a, a + STEP) / HOUR); reset.push(first ? 1 : 0); logEnd.push(li);
+          hi.push(i); on.push(overlap(spans, a, a + STEP) / HOUR); reset.push(first ? 1 : 0); logEnd.push(li); bgs.push(bgShare(a, a + STEP));
           blk.push(Math.max(0, Math.floor((now - a) / BLOCK)));
           first = false;
         }
@@ -556,7 +588,7 @@
       }
       if (i >= H.length) break;
     }
-    return { logs, n: hi.length, hi, on, reset, logEnd, blk, blocks: blk.length ? Math.max(...blk) + 1 : 1 };
+    return { logs, n: hi.length, hi, on, reset, logEnd, blk, bgs, blocks: blk.length ? Math.max(...blk) + 1 : 1 };
   }
 
   // drift: per-month factors { eff: [], heat: [] } (index 0 = the last 30 days); without it, today's for all
@@ -572,6 +604,7 @@
         while (li < P.logEnd[s]) { out.push({ S, air: h.air }); S = applyLog(S, logs[li]); li++; }
         const b = P.blk[s];
         S = stepS(S, h, 0.25, P.on[s], drift ? drift.eff[b] : cfg.eff, drift ? drift.heat[b] : cfg.heaterEff, decays ? decays[b] : decay).S;
+        if (cfg.bg > 0 && P.bgs[s]) S = drawS(S, cfg.bg * P.bgs[s]).S;
       }
     } finally { seasonAir = null; }
     while (out.length < logs.length) out.push({ S, air: airMean() });
@@ -586,6 +619,8 @@
   // the cooling moves between months only on clear evidence (freer, it soaked up other misfits)
   const TAU_DRIFT_WEIGHT = 60; // tested: 6 lost 3 of 36 hot showers on the accelerator check, 60 kept it, and still learned the cold
   const HISTORY = 365 * DAY, HALF_LIFE = 90 * DAY, MIN_WEIGHT = 0.25, BLOCK = 30 * DAY, DRIFT_WEIGHT = 6;
+  // unlogged use: learned from this many showers on; a shower's worth a day costs as much as a factor 2.7 off its default
+  const BG_MIN_LOGS = 12, BG_SHIFT = 10, BG_WEIGHT = 1;
   const weight = (l, now) => Math.max(MIN_WEIGHT, Math.pow(0.5, (now - l.t) / HALF_LIFE));
 
   function learnableLogs() {
@@ -648,6 +683,11 @@
       const m = member(id);
       if (m) knobs.push(knob(() => need(m), v => { m.liters = v; }, cfg.perPerson, 5, 250, 'use'));
     }
+    // hot water nobody logged, once there are enough showers to tell it from the rest (searched with an
+    // offset, since the search multiplies and 0 is where it starts)
+    const bgOn = logs.length >= BG_MIN_LOGS;
+    if (!bgOn) cfg.bg = 0;
+    else knobs.push(knob(() => cfg.bg + BG_SHIFT, v => { cfg.bg = Math.max(0, v - BG_SHIFT); }, null, BG_SHIFT, BG_SHIFT + 200, 'bg'));
     // Directions to search: each factor alone, plus factors that can stand in for each other moved
     // together (every month's sun; sun + boiler heating; everyone's usage), or the search stalls where one compensates
     const moves = knobs.map(k => [k]);
@@ -658,7 +698,8 @@
     const smooth = (arr) => arr.reduce((s, v, b) => s + (b ? sq(Math.log(v / arr[b - 1])) : 0), 0);
     const cost = () => negLogLik(P, now, drift)
       + PRIOR_WEIGHT * knobs.reduce((s, k) => s + (k.prior ? sq(Math.log(k.get() / k.prior)) : 0), 0)
-      + DRIFT_WEIGHT * (smooth(drift.eff) + (elec.length ? smooth(drift.heat) : 0)) + TAU_DRIFT_WEIGHT * smooth(drift.tau);
+      + DRIFT_WEIGHT * (smooth(drift.eff) + (elec.length ? smooth(drift.heat) : 0)) + TAU_DRIFT_WEIGHT * smooth(drift.tau)
+      + BG_WEIGHT * sq(cfg.bg / cfg.perPerson);
     // Multiplicative coordinate search, coarse to fine
     let best = cost();
     for (const f of [1.6, 1.25, 1.08, 1.02]) {
@@ -682,7 +723,8 @@
     const r3 = (arr) => arr.map(v => +v.toFixed(3));
     Object.assign(cfg, { effMonths: r3(drift.eff), heatMonths: r3(drift.heat), driftAt: now });
     if (drift.tau) cfg.tauMonths = drift.tau.map(v => +v.toFixed(1));
-    const ops = [{ op: 'cfg', cfg: { eff: +cfg.eff.toFixed(3), tau: +cfg.tau.toFixed(1), heaterEff: +cfg.heaterEff.toFixed(3), effMonths: cfg.effMonths, heatMonths: cfg.heatMonths, driftAt: now } }];
+    cfg.bg = Math.round(cfg.bg);
+    const ops = [{ op: 'cfg', cfg: { eff: +cfg.eff.toFixed(3), tau: +cfg.tau.toFixed(1), heaterEff: +cfg.heaterEff.toFixed(3), effMonths: cfg.effMonths, heatMonths: cfg.heatMonths, driftAt: now, bg: cfg.bg } }];
     if (drift.tau) ops[0].cfg.tauMonths = cfg.tauMonths;
     if (acc.length) ops[0].cfg.accFrac = +cfg.accFrac.toFixed(2);
     for (const m of fam.members) {
@@ -713,6 +755,8 @@
     const sh = cfg.heaterEff / before.heaterEff;
     if (sh > 1.08) parts.push('הדוד החשמלי מחמם מהר יותר ממה שחשבנו.');
     else if (sh < 0.93) parts.push('הדוד החשמלי מחמם לאט יותר ממה שחשבנו.');
+    if (cfg.bg - (before.bg || 0) >= 8) parts.push('כנראה הולכים יותר מים חמים מחוץ למקלחות (כלים, ידיים, אורחים) ממה שחשבנו.');
+    else if ((before.bg || 0) - cfg.bg >= 8) parts.push('הולכים פחות מים חמים מחוץ למקלחות ממה שחשבנו.');
     return parts.length ? parts.join(' ') : SAME;
   }
   const SAME = 'תואם את מה שכבר למדנו.';
@@ -1473,7 +1517,7 @@
     const l = { id: uid(), member: id, t, outcome };
     const T0 = run(l.t).T;
     const m = member(id);
-    const before = { liters: need(m), eff: cfg.eff, tau: cfg.tau, heaterEff: cfg.heaterEff };
+    const before = { liters: need(m), eff: cfg.eff, tau: cfg.tau, heaterEff: cfg.heaterEff, bg: cfg.bg };
     fam.logs.push(l);
     const ops = fit(); // adjusts cfg and members in place, and returns them as ops to share
     const text = lesson(before, l);
@@ -1740,6 +1784,12 @@
     return `🔍 האתר יבדוק לבד אם יש בדוד מאיץ חימום. לשם כך הוא צריך ${ltr(ACCEL_RUNS)} ערבים שבהם הדוד הודלק לפחות חצי שעה ואחר כך התקלחו שניים או יותר (עד עכשיו: ${ltr(Math.min(ACCEL_RUNS, accelEvidence(Date.now())))}). <a href="faq.html#accelerator">מה זה?</a>`;
   }
 
+  function bgNote() {
+    if (learnableLogs().length < BG_MIN_LOGS) return `🚰 מים חמים מחוץ למקלחות (כלים, ידיים, אורחים): האתר ילמד כמה הולך כך אחרי ${ltr(BG_MIN_LOGS)} מקלחות רשומות.`;
+    if (cfg.bg < 5) return '🚰 מים חמים מחוץ למקלחות (כלים, ידיים, אורחים): כמעט אין. מקלחת שלא נרשמה לא מקלקלת – התחזית ממילא מניחה שכל בני הבית מתקלחים.';
+    return `🚰 מים חמים מחוץ למקלחות שנרשמו (כלים, ידיים, אורחים): כ-${ltr(cfg.bg + ' ליטר')} ביום, בערך ${ltr(Math.round(cfg.bg / Math.max(1, cfg.perPerson) * 10) / 10)} מקלחות. האתר מוריד אותם מהדוד בין <span dir="ltr">17:00</span> ל-<span dir="ltr">24:00</span>. `;
+  }
+
   // What the learning found, month by month (100% = an average tank)
   function learnedHtml() {
     const at = cfg.driftAt || Date.now();
@@ -1757,6 +1807,7 @@
       <p class="note">כמה מהר הדוד שלכם מתחמם בכל חודש, ביחס לדוד ממוצע (<span dir="ltr">100%</span>). ירידה יכולה לרמז על קולטים מאובקים או אבנית בגוף החימום; עלייה – למשל אחרי גשם שניקה את הקולטים. כשבחודש האחרון החימום יורד בחמישית (20%) או יותר לעומת החודשים הקודמים, מופיעה התראה בלשונית "היום". <a href="faq.html#faults">איך זה עובד?</a></p>
       <table class="months"><thead><tr><th>תקופה</th><th>מהשמש</th>${elec ? '<th>מהדוד החשמלי</th>' : ''}<th>שומר חום</th></tr></thead><tbody>${rows}</tbody></table>
       <p class="note">${accelNote()}</p>
+      <p class="note">${bgNote()}</p>
       <p class="note">"שומר חום": אחרי כמה שעות נשאר בדוד חצי מהחום שמעל טמפ׳ האוויר – בחורף, על גג קר ובמקום עם רוח, זה פחות. כמה כל אחד צורך – בלשונית "משפחה".${cfg.effMonths ? '' : ' (הפירוט לפי חודשים יופיע אחרי הלמידה הבאה.)'}</p>
     </div>`;
   }
@@ -2024,7 +2075,7 @@
       setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     } else if (b.id === 'resetLearn') {
       if (!confirm('לאפס את מה שנלמד (ליטרים לכל אחד וכיול הדוד)? יומן המקלחות יישמר.')) return;
-      commit([...fam.members.map(m => ({ op: 'member', m: { id: m.id, liters: null, n: 0 } })), { op: 'cfg', cfg: { eff: DEFAULTS.eff, heaterEff: DEFAULTS.heaterEff, tau: DEFAULTS.tau, effMonths: null, heatMonths: null, tauMonths: null, driftAt: null } }]);
+      commit([...fam.members.map(m => ({ op: 'member', m: { id: m.id, liters: null, n: 0 } })), { op: 'cfg', cfg: { eff: DEFAULTS.eff, heaterEff: DEFAULTS.heaterEff, tau: DEFAULTS.tau, effMonths: null, heatMonths: null, tauMonths: null, driftAt: null, bg: 0 } }]);
     } else if (b.id === 'connectBtn') {
       b.disabled = true; b.textContent = 'מתחבר…';
       connect($('syncUrl').value, $('syncKey').value);
@@ -2108,7 +2159,7 @@
     const h = d.hourly;
     const gti = h.tank_gti || (h.global_tilted_irradiance && h.global_tilted_irradiance.some(v => v != null) ? h.global_tilted_irradiance : h.shortwave_radiation);
     return h.time.map((t, i) => {
-      const end = Date.parse(t + ':00Z') - off;
+      const end = h.unix ? h.unix[i] : Date.parse(t + ':00Z') - off; // unix: true instants, also before a clock change
       return { start: end - HOUR, end, gti: Math.max(0, gti[i] ?? 0), ta: h.temperature_2m?.[i] };
     });
   }
