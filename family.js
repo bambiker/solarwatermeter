@@ -781,7 +781,7 @@
   function plan(t, slot, extra = [], away = new Set()) {
     const S0 = run(t, extra).S, T0 = S0.t;
     let S = S0;
-    const who = fam.members.filter(m => !isGeneric(m) && (!m.skip || !m.skip[slot]) && !away.has(m.id));
+    const who = ordered(fam.members.filter(m => !isGeneric(m) && (!m.skip || !m.skip[slot]) && !away.has(m.id)));
     const rows = who.map(m => {
       const D = showerOf(S, m);
       const st = D.end >= okEnd() - 0.05 ? 'ok' : D.start > tsh() ? 'partial' : 'cold';
@@ -859,6 +859,27 @@
     const a = store.get('hwm.away', null);
     return new Set(a && a.d === localStr(tonightAt(now)).slice(0, 10) ? a.ids : []);
   }
+  // Today's shower order, when it isn't the usual one (set on the main card, kept on this device for that
+  // day only – the usual order is the family's, in the "משפחה" tab)
+  function todayOrder(now = Date.now()) {
+    const o = store.get('hwm.order', null);
+    return o && o.d === localStr(tonightAt(now)).slice(0, 10) ? o.ids : null;
+  }
+  function ordered(list) {
+    const o = todayOrder();
+    if (!o) return list;
+    const pos = (m) => { const i = o.indexOf(m.id); return i < 0 ? o.length + fam.members.indexOf(m) : i; };
+    return list.slice().sort((a, b) => pos(a) - pos(b));
+  }
+  let reorder = false;
+  function moveInOrder(id, dir) {
+    const ids = ordered(fam.members.filter(m => !isGeneric(m))).map(m => m.id), i = ids.indexOf(id), j = i + dir;
+    if (i < 0 || j < 0 || j >= ids.length) return;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    store.set('hwm.order', { d: localStr(tonightAt(Date.now())).slice(0, 10), ids });
+    tipCache.key = '';
+    render();
+  }
   function toggleAway(id) {
     const now = Date.now(), set = awayTonight(now);
     if (set.has(id)) set.delete(id); else set.add(id);
@@ -873,14 +894,20 @@
   // who showered in the last few hours (won't shower again now)
   const showeredRecently = (now) => new Set(fam.logs.filter(l => l.t <= now && now - l.t < 6 * HOUR).map(l => l.member));
 
-  // What the main card answers: this evening's showers until they start; from then on – through the
-  // night and the morning showers – right now
+  // What the main card answers: right now – who showers now, is it enough for them – which is what people
+  // usually ask. Before the evening showers a switch shows the evening instead (kept for that day only).
+  const eveningAhead = (now) => { // the evening showers are still to come today
+    const day0 = dayStart(now), at = (hm) => { const [h, m] = hm.split(':').map(Number); return day0 + h * HOUR + m * 60000; };
+    return now < at(slotTime('evening')) && now >= at(slotTime('morning')) + 2 * HOUR ? at(slotTime('evening')) : null;
+  };
+  function heroView(now) {
+    const v = store.get('hwm.heroView', null);
+    return v && v.d === localStr(now).slice(0, 10) ? v.v : 'now';
+  }
   function heroTarget(now) {
-    const day0 = dayStart(now);
-    const at = (hm) => { const [h, m] = hm.split(':').map(Number); return day0 + h * HOUR + m * 60000; };
-    if (now >= at(slotTime('evening')) || now < at(slotTime('morning')) + 2 * HOUR)
-      return { t: now, now: true, slot: now - day0 >= 12 * HOUR ? 'evening' : 'morning' };
-    return { t: at(slotTime('evening')), now: false, slot: 'evening' };
+    const day0 = dayStart(now), eve = eveningAhead(now);
+    if (eve && heroView(now) === 'evening') return { t: eve, now: false, slot: 'evening' };
+    return { t: now, now: true, slot: now - day0 >= 12 * HOUR ? 'evening' : 'morning' };
   }
 
   // Heating for each person separately, right before their own shower: just enough for them, in the
@@ -1278,7 +1305,15 @@
       const order = (kept || he.rows).map(r => r.m);
       const notLast = order.filter((m, i) => isElastic(m) && order.slice(i + 1).some(x => !isElastic(x)));
       const elasticNote = order.some(isElastic) ? `<p class="note">⏳ ${order.filter(isElastic).map(m => esc(m.name)).join(' ו')} בדרך כלל ${order.filter(isElastic).length > 1 ? 'מתקלחים' : 'מתקלח/ת'} עד שהמים החמים נגמרים, אז הדקות ${order.filter(isElastic).length > 1 ? 'שלהם' : 'כאן'} מחושבות למקלחת רגילה – עוד דוד רק יאריך אותה.${notLast.length ? ` <b>כדאי ש${notLast.map(m => esc(m.name)).join(' ו')} ${notLast.length > 1 ? 'יתקלחו אחרונים' : 'יתקלח/תתקלח אחרון/ה'}</b>, כדי שיישארו מים חמים לאחרים.` : ''} <a class="why" href="faq.html#uses-it-all">למה?</a></p>` : '';
-      body = `<ul class="people">${slotPeople(sh.slot).map(item).join('')}</ul>
+      const list = ordered(slotPeople(sh.slot));
+      const moveRow = (m, i) => `<li class="mv"><span class="n">${ltr(i + 1)}.</span> ${esc(m.name)}
+        <button type="button" data-move="${m.id}" data-dir="-1" aria-label="${esc(m.name)} – מוקדם יותר" ${i ? '' : 'disabled'}>▲</button>
+        <button type="button" data-move="${m.id}" data-dir="1" aria-label="${esc(m.name)} – מאוחר יותר" ${i < list.length - 1 ? '' : 'disabled'}>▼</button></li>`;
+      const orderCtl = list.length > 1 ? (reorder
+        ? `<p class="order-ctl"><button type="button" class="linkish" data-reorder="done">✓ סיום</button>${todayOrder() ? ' · <button type="button" class="linkish" data-reorder="reset">לסדר הרגיל</button>' : ''}</p>`
+        : `<p class="order-ctl"><button type="button" class="linkish" data-reorder="on">↕ שינוי סדר המקלחות${todayOrder() ? ' (היום בסדר אחר)' : ' להיום'}</button></p>`) : '';
+      body = `${reorder ? `<ul class="people order">${list.map(moveRow).join('')}</ul>` : `<ul class="people">${list.map(item).join('')}</ul>`}
+        ${orderCtl}
         ${elasticNote}
         ${on ? (tn.total ? keepOnAdvice(kept) : '')
           : he.total ? `<p class="advice warn">🔌 כל אחד מדליק את הדוד לפני המקלחת שלו, לפי הדקות שליד השם – סה״כ כ-${ltr(he.total)} דקות.${why('heat-each-or-all')}</p>` : ''}
@@ -1292,7 +1327,12 @@
     }
     const sunLeft = sunToday && !sh.isNow ? sunToday.total - sunToday.soFar : 0;
     const strip = [sh.yday && `אתמול${sh.isNow ? ' באותה שעה' : ''}: ${sh.say(sh.yday)}`, sh.tmrw && `מחר${sh.isNow ? ' באותה שעה' : ''}: ${sh.say(sh.tmrw)}`].filter(Boolean).join(' · ');
+    const eve = eveningAhead(now);
+    const seg = eve ? `<div class="seg" role="group" aria-label="מתי">
+        <button type="button" data-hero-view="now" aria-pressed="${sh.isNow}">עכשיו</button>
+        <button type="button" data-hero-view="evening" aria-pressed="${!sh.isNow}">הערב (${ltr(hhmm(eve))})</button></div>` : '';
     box.innerHTML = `<section class="card hero">
+      ${seg}
       <div class="hero-top">
         ${tankSvg(cur, curS)}
         <div>${head}</div>
@@ -1380,6 +1420,16 @@
   document.addEventListener('click', (e) => {
     const b = e.target.closest('[data-away]');
     if (b) toggleAway(b.dataset.away);
+    const mv = e.target.closest('[data-move]');
+    if (mv) moveInOrder(mv.dataset.move, +mv.dataset.dir);
+    const ro = e.target.closest('[data-reorder]');
+    if (ro) {
+      if (ro.dataset.reorder === 'reset') store.set('hwm.order', null);
+      reorder = ro.dataset.reorder === 'on' || (ro.dataset.reorder === 'reset' && reorder);
+      tipCache.key = ''; render();
+    }
+    const hv = e.target.closest('[data-hero-view]');
+    if (hv) { store.set('hwm.heroView', { d: localStr(Date.now()).slice(0, 10), v: hv.dataset.heroView }); tipCache.key = ''; render(); }
   });
 
   document.addEventListener('click', (e) => {
