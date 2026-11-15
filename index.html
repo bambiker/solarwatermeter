@@ -229,6 +229,16 @@
   .people .away .dot { border: 2px dashed var(--ink-3); }
   .people .st { margin-inline-start: auto; font-size: .8rem; color: var(--ink-2); white-space: nowrap; }
   .people .heat .st { color: var(--accent); font-weight: 700; }
+  .seg { display: flex; gap: 4px; background: var(--bg); border-radius: 999px; padding: 3px; align-self: flex-start; }
+  .seg button { border: none; background: none; color: var(--ink-2); font: inherit; font-weight: 600; font-size: .9rem; padding: 6px 14px; border-radius: 999px; min-height: 36px; cursor: pointer; }
+  .seg button[aria-pressed="true"] { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  .people.order { grid-template-columns: 1fr; }
+  .people .mv { display: flex; align-items: center; gap: 8px; padding: 4px 4px 4px 10px; min-height: 44px; font-weight: 500; }
+  .people .mv .n { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+  .people .mv button { width: 44px; min-height: 40px; justify-content: center; background: var(--surface); border: 1px solid var(--line); padding: 0; }
+  .people .mv button:first-of-type { margin-inline-start: auto; }
+  .people .mv button:disabled { opacity: .35; }
+  .order-ctl { margin: -6px 0 0; font-size: .9rem; }
   .hero-strip { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; font-size: .92rem; color: var(--ink-2); }
   .hero-strip a { margin-inline-start: auto; font-weight: 700; color: var(--accent); text-decoration: none; }
   .idx { display: flex; align-items: center; gap: 14px; margin-bottom: 12px; padding: 12px 16px; border-radius: 18px; }
@@ -863,7 +873,7 @@
   })();
 </script>
 <!-- ?v= changes with each release, so a phone never pairs a new page with an old cached script -->
-<script src="config.js?v=20261115a"></script>
-<script src="family.js?v=20261115a"></script>
+<script src="config.js?v=20261115b"></script>
+<script src="family.js?v=20261115b"></script>
 </body>
 </html>
